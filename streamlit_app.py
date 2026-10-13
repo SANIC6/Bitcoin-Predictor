@@ -1,10 +1,11 @@
-"""Streamlit showcase for `bitcoin_lstm_model_v1.pt`.
+"""Streamlit showcase — LSTM trained from scratch on fresh BTC data.
 
 The model: an LSTM that looks back 30 hours of BTC (price, volume, market
-cap) and calls the next hour's price. This app puts it in action on *fresh*
-data it has never seen:
+cap) and calls the next hour's price. This app trains it live on *fresh*
+data and puts it in action:
 
     - fetches the last 90 days of hourly BTC data from CoinGecko
+    - trains the LSTM from scratch on that data (no checkpoint file)
     - rolls the 30-hour window forward hour by hour, comparing each call
       to what actually happened
     - lets you scrub through time and watch the model work
@@ -28,14 +29,19 @@ import streamlit as st
 import torch
 import torch.nn as nn
 from dotenv import load_dotenv
+from torch import optim
+from torch.utils.data import DataLoader, Dataset
 
 # --------------------------------------------------------------------------
-# Constants — must mirror the notebook that trained the checkpoint
+# Constants — training defaults mirror main-notebook.ipynb
 # --------------------------------------------------------------------------
-CHECKPOINT_PATH = "bitcoin_lstm_model_v1.pt"
 SEQ_LEN = 30          # hours of lookback
-HIDDEN_SIZE = 5       # LSTM hidden units
-NUM_LAYERS = 1        # LSTM layers
+DEFAULT_HIDDEN_SIZE = 5   # LSTM hidden units
+DEFAULT_NUM_LAYERS = 1    # LSTM layers
+DEFAULT_EPOCHS = 100
+DEFAULT_LR = 0.01
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_SEED = 42
 FEATURES = ["price", "volume", "market_cap"]   # column order matters!
 PRICE_COL = 0         # index of the price feature inside FEATURES
 PLAY_STEP_SLEEP = 0.12   # seconds between frames while ▶ Play is running
@@ -52,11 +58,11 @@ MUTED = "#8A94B0"
 
 
 # --------------------------------------------------------------------------
-# Model — exact replica of the architecture in main-notebook.ipynb
+# Model — same architecture as main-notebook.ipynb
 # --------------------------------------------------------------------------
 class PriceLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size=HIDDEN_SIZE,
-                 num_stacked_layers=NUM_LAYERS, batch_first=True):
+    def __init__(self, input_size, hidden_size=DEFAULT_HIDDEN_SIZE,
+                 num_stacked_layers=DEFAULT_NUM_LAYERS, batch_first=True):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -74,13 +80,129 @@ class PriceLSTM(nn.Module):
         return out
 
 
-@st.cache_resource(show_spinner="Loading the trained LSTM…")
-def load_model() -> tuple[PriceLSTM, dict]:
-    checkpoint = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
-    model = PriceLSTM(input_size=len(FEATURES))
-    model.load_state_dict(checkpoint["model_state_dict"])
+class TimeSeriesDataset(Dataset):
+    """Sliding-window dataset — mirrors main-notebook.ipynb cell 4."""
+
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = X
+        self.y = y
+
+    def __len__(self) -> int:
+        return len(self.X)
+
+    def __getitem__(self, index: int):
+        return self.X[index], self.y[index]
+
+
+def _make_windows(data: np.ndarray, seq_len: int = SEQ_LEN):
+    X, y = [], []
+    for i in range(len(data) - seq_len):
+        X.append(data[i:i + seq_len])
+        y.append(data[i + seq_len, PRICE_COL])  # next-hour price
+    return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.float32)
+
+
+@st.cache_resource(show_spinner="Training LSTM from scratch on fresh data…")
+def train_fresh_model(df: pd.DataFrame, num_epochs: int = DEFAULT_EPOCHS,
+                      learning_rate: float = DEFAULT_LR,
+                      hidden_size: int = DEFAULT_HIDDEN_SIZE,
+                      num_layers: int = DEFAULT_NUM_LAYERS,
+                      batch_size: int = DEFAULT_BATCH_SIZE,
+                      seed: int = DEFAULT_SEED) -> tuple[PriceLSTM, dict]:
+    """Train the price LSTM from scratch on the freshly fetched frame.
+
+    Mirrors main-notebook.ipynb cells 4/5/7/10: 70/15/15 split, z-score
+    scaler fit on train only, MSELoss + Adam(weight_decay=1e-4), and USD
+    metrics un-scaled with the *training* mean/std (index 0 = price).
+
+    Cached on (data + hyperparams) so slider/playback reruns don't retrain;
+    any new fetch or hyperparameter change triggers a real retrain.
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    values = df[FEATURES].to_numpy(dtype=np.float32)
+    n = len(values)
+    train_end = int(n * 0.7)
+    val_end = int(n * 0.85)
+
+    mean = values[:train_end].mean(axis=0)
+    std = values[:train_end].std(axis=0)
+    std[std == 0] = 1.0
+
+    train = (values[:train_end] - mean) / std
+    val = (values[train_end:val_end] - mean) / std
+    test = (values[val_end:] - mean) / std
+
+    X_train, y_train = _make_windows(train)
+    X_val, y_val = _make_windows(val)
+    X_test, y_test = _make_windows(test)
+
+    train_loader = DataLoader(TimeSeriesDataset(X_train, y_train),
+                              batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TimeSeriesDataset(X_val, y_val),
+                            batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(TimeSeriesDataset(X_test, y_test),
+                             batch_size=batch_size, shuffle=False)
+
+    model = PriceLSTM(input_size=len(FEATURES), hidden_size=hidden_size,
+                      num_stacked_layers=num_layers)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate,
+                           weight_decay=1e-4)
+
+    training_loss: list[float] = []
+    testing_loss: list[float] = []
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+        for feature, label in train_loader:
+            optimizer.zero_grad()
+            pred = model(feature).squeeze(-1)
+            loss = criterion(pred, label)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        training_loss.append(train_loss / max(len(train_loader), 1))
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for feature, label in val_loader:
+                pred = model(feature).squeeze(-1)
+                val_loss += criterion(pred, label).item()
+        testing_loss.append(val_loss / max(len(val_loader), 1))
+
+    # Test metrics in real USD (notebook cell 10 fix: use training mean/std).
     model.eval()
-    return model, checkpoint
+    price_mean, price_std = float(mean[PRICE_COL]), float(std[PRICE_COL])
+    all_preds, all_true = [], []
+    with torch.no_grad():
+        for feature, label in test_loader:
+            pred = model(feature).squeeze(-1)
+            all_preds.append(pred.cpu().numpy() * price_std + price_mean)
+            all_true.append(label.cpu().numpy() * price_std + price_mean)
+    all_preds = np.concatenate(all_preds) if all_preds else np.array([])
+    all_true = np.concatenate(all_true) if all_true else np.array([])
+    rmse_usd = float(np.sqrt(np.mean((all_preds - all_true) ** 2))) if len(all_true) else 0.0
+    mae_usd = float(np.mean(np.abs(all_preds - all_true))) if len(all_true) else 0.0
+
+    stats = {
+        "mean": mean.astype(np.float32),
+        "std": std.astype(np.float32),
+        "training_loss": training_loss,
+        "testing_loss": testing_loss,
+        "rmse_usd": rmse_usd,
+        "mae_usd": mae_usd,
+        "num_epochs": num_epochs,
+        "learning_rate": learning_rate,
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        "batch_size": batch_size,
+        "seed": seed,
+    }
+    model.eval()
+    return model, stats
 
 
 # --------------------------------------------------------------------------
@@ -90,8 +212,9 @@ def load_model() -> tuple[PriceLSTM, dict]:
 def fetch_market_data(days: int = 90) -> pd.DataFrame:
     load_dotenv()
     headers = {"accept": "application/json"}
-    if os.getenv("COIN_API"):
-        headers["x-cg-demo-api-key"] = os.getenv("COIN_API")
+    api_key = os.getenv("COIN_API")
+    if api_key:
+        headers["x-cg-demo-api-key"] = api_key
     resp = requests.get(
         "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
         params={"vs_currency": "usd", "days": days},
@@ -115,29 +238,29 @@ def fetch_market_data(days: int = 90) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # Prediction helpers — identical normalization to training
 # --------------------------------------------------------------------------
-def _normalize(values: np.ndarray, checkpoint: dict) -> np.ndarray:
-    mean = np.asarray(checkpoint["mean"], dtype=np.float32)
-    std = np.asarray(checkpoint["std"], dtype=np.float32)
+def _normalize(values: np.ndarray, stats: dict) -> np.ndarray:
+    mean = np.asarray(stats["mean"], dtype=np.float32)
+    std = np.asarray(stats["std"], dtype=np.float32)
     std[std == 0] = 1.0
     return (values - mean) / std
 
 
 def rolling_backtest(df: pd.DataFrame, model: PriceLSTM,
-                     checkpoint: dict) -> pd.DataFrame:
+                     stats: dict) -> pd.DataFrame:
     """For every hour, the model sees only the preceding 30 and calls the next.
 
     Returns a frame aligned on the *predicted* hour: actual vs prediction vs
     the last price the model actually saw.
     """
     values = df[FEATURES].to_numpy(dtype=np.float32)
-    norm = _normalize(values, checkpoint)
+    norm = _normalize(values, stats)
 
     X = np.stack([norm[i:i + SEQ_LEN] for i in range(len(norm) - SEQ_LEN)])
     with torch.no_grad():
         preds_norm = model(torch.from_numpy(X)).squeeze(-1).numpy()
 
-    mean = np.asarray(checkpoint["mean"], dtype=np.float32)
-    std = np.asarray(checkpoint["std"], dtype=np.float32)
+    mean = np.asarray(stats["mean"], dtype=np.float32)
+    std = np.asarray(stats["std"], dtype=np.float32)
     preds_usd = preds_norm * std[PRICE_COL] + mean[PRICE_COL]      # un-scale price
     actual_usd = values[SEQ_LEN:, PRICE_COL]                       # the true next price
 
@@ -155,15 +278,15 @@ def rolling_backtest(df: pd.DataFrame, model: PriceLSTM,
 
 
 def next_hour_call(df: pd.DataFrame, model: PriceLSTM,
-                   checkpoint: dict) -> float:
+                   stats: dict) -> float:
     """The model's call for the hour after the most recent data point."""
     values = df[FEATURES].to_numpy(dtype=np.float32)
-    norm = _normalize(values, checkpoint)
+    norm = _normalize(values, stats)
     window = torch.from_numpy(norm[-SEQ_LEN:]).unsqueeze(0)
     with torch.no_grad():
         pred = model(window).item()
-    mean = np.asarray(checkpoint["mean"], dtype=np.float32)
-    std = np.asarray(checkpoint["std"], dtype=np.float32)
+    mean = np.asarray(stats["mean"], dtype=np.float32)
+    std = np.asarray(stats["std"], dtype=np.float32)
     return float(pred * std[PRICE_COL] + mean[PRICE_COL])
 
 
@@ -299,28 +422,64 @@ def fmt_usd(x: float) -> str:
 # --------------------------------------------------------------------------
 # Sidebar
 # --------------------------------------------------------------------------
-def render_sidebar(checkpoint: dict, fetched_at: datetime) -> None:
+def render_training_controls() -> dict:
+    """Training hyperparameters — lives in the sidebar, read before training.
+
+    Changing any widget changes the cache key of `train_fresh_model`, so a
+    real retrain happens automatically. Playback/slider reruns with unchanged
+    values hit the cache and do NOT retrain.
+    """
+    with st.sidebar:
+        st.markdown("### 🏋️ Training (from scratch)")
+        st.caption("No checkpoint file — the LSTM trains live on the data above.")
+        num_epochs = st.slider("Epochs", 10, 200, DEFAULT_EPOCHS, step=10)
+        learning_rate = st.selectbox(
+            "Learning rate",
+            [0.001, 0.005, 0.01, 0.02],
+            index=2,
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            hidden_size = st.number_input("Hidden", 2, 32, DEFAULT_HIDDEN_SIZE, step=1)
+        with c2:
+            num_layers = st.number_input("Layers", 1, 3, DEFAULT_NUM_LAYERS, step=1)
+        seed = st.number_input("Seed", 0, 9999, DEFAULT_SEED, step=1)
+        if st.button("🏋️ Retrain from scratch", use_container_width=True):
+            train_fresh_model.clear()
+            st.rerun()
+    return {
+        "num_epochs": int(num_epochs),
+        "learning_rate": float(learning_rate),
+        "hidden_size": int(hidden_size),
+        "num_layers": int(num_layers),
+        "seed": int(seed),
+    }
+
+
+def render_sidebar(stats: dict, fetched_at: datetime) -> None:
     with st.sidebar:
         st.markdown("### 🧠 Model card")
+        # NOTE: built with a plain f-string below to avoid nested-quote issues.
         st.markdown(
-            f"""
-            <div class="metric-card" style="margin-bottom:0.6rem;">
-              <div class="label">Architecture</div>
-              <div class="value" style="font-size:1.02rem;">LSTM → Linear</div>
-              <div class="sub">hidden {HIDDEN_SIZE} · {NUM_LAYERS} layer · 30h lookback</div>
-            </div>
-            """, unsafe_allow_html=True)
+            f"<div class='metric-card' style='margin-bottom:0.6rem;'>"
+            f"<div class='label'>Architecture</div>"
+            f"<div class='value' style='font-size:1.02rem;'>LSTM → Linear</div>"
+            f"<div class='sub'>hidden {stats.get('hidden_size', '?')} · "
+            f"{stats.get('num_layers', '?')} layer(s) · 30h lookback · "
+            f"fresh-trained, no .pt file</div></div>",
+            unsafe_allow_html=True)
 
         c1, c2 = st.columns(2)
         with c1:
-            st.metric("Test RMSE", f"${checkpoint.get('rmse_usd', 0):,.0f}")
+            st.metric("Test RMSE", f"${stats.get('rmse_usd', 0):,.0f}")
         with c2:
-            st.metric("Test MAE", f"${checkpoint.get('mae_usd', 0):,.0f}")
+            st.metric("Test MAE", f"${stats.get('mae_usd', 0):,.0f}")
 
         st.markdown(
             f"<div class='sub' style='font-size:0.8rem;color:{MUTED};'>"
-            f"trained {checkpoint.get('num_epochs', '?')} epochs · "
-            f"lr {checkpoint.get('learning_rate', '?')} · "
+            f"trained {stats.get('num_epochs', '?')} epochs · "
+            f"lr {stats.get('learning_rate', '?')} · "
+            f"seed {stats.get('seed', '?')} · "
             f"features: price, volume, market cap</div>",
             unsafe_allow_html=True,
         )
@@ -330,17 +489,18 @@ def render_sidebar(checkpoint: dict, fetched_at: datetime) -> None:
         st.markdown(
             f"<div style='font-size:0.85rem;color:{MUTED};'>"
             "1. Fresh hourly BTC data is pulled from CoinGecko.<br>"
-            "2. Each hour, the model reads only the <b>previous 30 hours</b> "
+            "2. The LSTM trains <b>from scratch</b> on that data (70/15/15 "
+            "split, z-scored on train only).<br>"
+            "3. Each hour, the model reads only the <b>previous 30 hours</b> "
             "of price / volume / market cap.<br>"
-            "3. It calls the next hour's price — then we compare with reality.<br>"
-            "4. The blue star below is the model working <b>right now</b>, "
-            "on the hour that hasn't happened yet.</div>",
+            "4. It calls the next hour's price — then we compare with reality.</div>",
             unsafe_allow_html=True,
         )
 
         st.divider()
         if st.button("↻ Refresh data", use_container_width=True):
             fetch_market_data.clear()
+            train_fresh_model.clear()
             st.rerun()
         st.caption(f"Fetched {fetched_at:%b %d, %H:%M} UTC · CoinGecko hourly")
 
@@ -352,8 +512,6 @@ def main() -> None:
     st.set_page_config(page_title="BTC LSTM · Live Predictor",
                        page_icon="₿", layout="wide")
     inject_css()
-
-    model, checkpoint = load_model()
 
     try:
         df = fetch_market_data()
@@ -367,16 +525,22 @@ def main() -> None:
         st.error("Not enough data fetched to run the model.")
         return
 
-    bt = rolling_backtest(df, model, checkpoint)
+    # Hyperparams must be read BEFORE training so widget changes retrain.
+    train_params = render_training_controls()
+
+    with st.spinner("Training LSTM from scratch on fresh data…"):
+        model, stats = train_fresh_model(df, **train_params)
+
+    bt = rolling_backtest(df, model, stats)
     fetched_at = datetime.now(timezone.utc)
 
     # --- Hero -------------------------------------------------------------
     st.markdown(
         f"""
         <div class="hero">
-          <span class="live">● Live · predicting on unseen data</span>
+          <span class="live">● Live · trained from scratch on this data</span>
           <h1>₿ Watch an LSTM <span>call BTC</span>, hour by hour</h1>
-          <p>The model learned from historical price, volume and market cap —
+          <p>The model trains from scratch on fresh price, volume and market cap —
           and never sees the future. Every point on the violet line was made
           from only the <b>30 hours before it</b>.</p>
         </div>
@@ -385,7 +549,7 @@ def main() -> None:
     # --- KPI row ----------------------------------------------------------
     last_price = float(df["price"].iloc[-1])
     prev_price = float(df["price"].iloc[-25])          # ~24h earlier
-    next_call = next_hour_call(df, model, checkpoint)
+    next_call = next_hour_call(df, model, stats)
     bt_rmse = float(np.sqrt(np.mean((bt["actual"] - bt["prediction"]) ** 2)))
     bt_mae = float(np.mean(np.abs(bt["actual"] - bt["prediction"])))
 
@@ -406,6 +570,16 @@ def main() -> None:
         metric_card("Rolling MAE", fmt_usd(bt_mae),
                     "typical miss vs the actual hour",
                     GREEN), unsafe_allow_html=True)
+
+    # --- Training curves (this run, from scratch) -------------------------
+    st.markdown('<div class="section-title">Training — from scratch, just now</div>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="section-sub">MSE loss per epoch on the fresh fetch. '
+                'Change epochs / lr / hidden size in the sidebar to retrain.</div>',
+                unsafe_allow_html=True)
+    st.line_chart(
+        {"train": stats["training_loss"], "val": stats["testing_loss"]},
+    )
 
     # --- Rolling backtest chart ------------------------------------------
     st.markdown('<div class="section-title">Rolling backtest — every call vs reality</div>',
@@ -492,12 +666,13 @@ def main() -> None:
         st.rerun()
 
     st.markdown(
-        f"<div class='footnote'>Built for the {SEQ_LEN}-hour price LSTM in "
-        f"<code>bitcoin_lstm_model_v1.pt</code>. Metrics: {fmt_usd(bt_rmse)} "
+        f"<div class='footnote'>Fresh-trained {SEQ_LEN}-hour price LSTM "
+        f"(no checkpoint file · {stats.get('num_epochs')} epochs, seed "
+        f"{stats.get('seed')}). Metrics: {fmt_usd(bt_rmse)} "
         f"RMSE / {fmt_usd(bt_mae)} MAE across the full {len(bt):,}-hour backtest.</div>",
         unsafe_allow_html=True)
 
-    render_sidebar(checkpoint, fetched_at)
+    render_sidebar(stats, fetched_at)
 
 
 if __name__ == "__main__":
